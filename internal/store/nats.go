@@ -74,6 +74,7 @@ func (n *NATS) List(ctx context.Context, prefix string) (map[string]Entry, error
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = lister.Stop() }()
 	result := make(map[string]Entry)
 	for key := range lister.Keys() {
 		if !strings.HasPrefix(key, prefix) {
@@ -88,5 +89,19 @@ func (n *NATS) List(ctx context.Context, prefix string) (map[string]Entry, error
 		}
 		result[key] = entry
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return result, nil
+}
+
+func (n *NATS) DeleteRevision(ctx context.Context, key string, revision uint64) error {
+	err := n.kv.Purge(ctx, key, jetstream.LastRevision(revision))
+	if errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
+		return ErrConflict
+	}
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return ErrNotFound
+	}
+	return err
 }

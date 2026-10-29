@@ -19,6 +19,8 @@ type Config struct {
 	KVBucket            string
 	CleanupSubject      string
 	CleanupTimeout      time.Duration
+	CleanupInterval     time.Duration
+	CleanupBatchSize    int
 	SigningKeyFile      string
 	InvitationHMACKey   string
 	TokenTTL            time.Duration
@@ -60,6 +62,15 @@ func Load() (Config, error) {
 	}
 	if c.CleanupTimeout, err = duration("NGA_CLEANUP_TIMEOUT", 30*time.Second); err != nil {
 		return Config{}, err
+	}
+	if c.CleanupInterval, err = duration("NGA_CLEANUP_INTERVAL", 10*time.Second); err != nil {
+		return Config{}, err
+	}
+	if c.CleanupBatchSize, err = integer("NGA_CLEANUP_BATCH_SIZE", 25); err != nil {
+		return Config{}, err
+	}
+	if c.CleanupInterval <= 0 || c.CleanupBatchSize < 1 || c.CleanupBatchSize > 1000 {
+		return Config{}, errors.New("cleanup interval must be positive and batch size between 1 and 1000")
 	}
 	if c.MaxCapacity, err = integer("NGA_MAX_CAPACITY", 100); err != nil {
 		return Config{}, err

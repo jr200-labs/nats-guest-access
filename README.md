@@ -159,3 +159,39 @@ the first automated release must be verified separately from file conformance.
 
 The shared groups fit this backend-only repository; no React starter, Node lane,
 Helm-chart publisher, or documentation-site publisher is selected.
+
+### Cleanup recovery and telemetry
+
+The service runs a bounded recovery controller every `NGA_CLEANUP_INTERVAL`
+(default `10s`), processing up to `NGA_CLEANUP_BATCH_SIZE` (default `25`) oldest-due
+intents. Events being deleted and slots awaiting erasure retain their identities
+and capacity until complete application acknowledgement. Expired, unreserved
+slots are reclaimed proactively; paused/reserved places are preserved.
+
+A KV compare-and-swap persists each intent, stable deletion ID, attempt count and
+next retry before the application call. Claims outlive the configured request
+timeout. Failures back off from five seconds to 160 seconds; process restarts
+resume the same intent. The application must make repeated cleanup calls
+idempotent, including after a lost response. Partial identity counts fail closed.
+All slot/event deletion uses an expected revision. Receipts are saved before
+state finalization, so interrupted finalization preserves the original count.
+Existing cookies receive a terminal deletion code through hashed tombstones;
+no raw resume secrets or JWTs are retained there.
+
+`GET /v1/receipts` returns the latest 100 receipts visible to the owner/deleting
+presenter. `GET /v1/events/{id}/receipt` reads one receipt. Event responses expose
+bounded cleanup status and slot responses expose `cleanup_pending`; no downstream
+error content is returned in progress. The same presenter verifier protects all
+three resources.
+
+`GET /metrics` exposes aggregate Prometheus counters/gauges:
+
+- `nga_cleanup_passes_total`, `nga_cleanup_completed_total`, `nga_cleanup_failures_total`
+- `nga_cleanup_pending`, `nga_cleanup_oldest_seconds`
+- `nga_cleanup_last_success_timestamp_seconds`
+
+Alert on a growing pending backlog/oldest age and stale successful scans, rather
+than counters alone. Metrics have no per-user/event/invitation labels. A scan
+failure retains the last known backlog instead of reporting a misleading zero.
+KV enumeration cost grows with retained events/receipts; production-scale scans
+and tombstone retention need measurement before increasing audience limits.

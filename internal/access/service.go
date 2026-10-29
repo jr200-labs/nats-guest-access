@@ -50,6 +50,7 @@ type Service struct {
 	gracePeriod   time.Duration
 	cleaner       Cleaner
 	now           func() time.Time
+	cleanupLease  time.Duration
 }
 
 type CreateEventInput struct {
@@ -80,7 +81,7 @@ func New(st store.Store, tokenIssuer *issuer.Issuer, hmacKey, publicDemoURL stri
 	return &Service{
 		store: st, issuer: tokenIssuer, hmacKey: []byte(hmacKey),
 		publicDemoURL: strings.TrimRight(publicDemoURL, "/"), maxCapacity: maxCapacity,
-		leaseTTL: leaseTTL, gracePeriod: gracePeriod, cleaner: cleaner, now: time.Now,
+		leaseTTL: leaseTTL, gracePeriod: gracePeriod, cleaner: cleaner, now: time.Now, cleanupLease: 45 * time.Second,
 	}
 }
 
@@ -180,6 +181,9 @@ func (s *Service) UpdateCapacity(ctx context.Context, principal, eventID string,
 		if !can(event, principal, model.CapabilityOperate) {
 			return model.Event{}, ErrForbidden
 		}
+		if event.State == model.EventDeleting {
+			return model.Event{}, ErrConflict
+		}
 		event.Capacity = capacity
 		event.UpdatedAt = s.now().UTC()
 		if _, err = s.store.Update(ctx, eventKey(eventID), encode(event), revision); errors.Is(err, store.ErrConflict) {
@@ -199,6 +203,9 @@ func (s *Service) RotateInvitation(ctx context.Context, principal, eventID strin
 	}
 	if !can(event, principal, model.CapabilityOperate) {
 		return "", ErrForbidden
+	}
+	if event.State == model.EventDeleting {
+		return "", ErrConflict
 	}
 	secret, err := randomSecret()
 	if err != nil {
@@ -232,6 +239,9 @@ func (s *Service) SetCohost(ctx context.Context, principal, eventID, cohost stri
 		}
 		if event.OwnerSubject != principal || cohost == "" || cohost == principal {
 			return model.Event{}, ErrForbidden
+		}
+		if event.State == model.EventDeleting {
+			return model.Event{}, ErrConflict
 		}
 		if event.Cohosts == nil {
 			event.Cohosts = map[string][]model.Capability{}
@@ -287,36 +297,34 @@ func (s *Service) StartSession(ctx context.Context, invitation string) (Session,
 			GraceExpiresAt: now.Add(s.leaseTTL + s.gracePeriod), CreatedAt: now, LastSeenAt: now,
 		}
 		key := slotKey(event.ID, number)
-		_, createErr := s.store.Create(ctx, key, encode(slot))
+		slotRevision, createErr := s.store.Create(ctx, key, encode(slot))
 		if errors.Is(createErr, store.ErrExists) {
 			existing, revision, loadErr := s.loadSlot(ctx, event.ID, number)
-			if loadErr != nil || existing.Reserved || now.Before(existing.GraceExpiresAt) {
+			if loadErr != nil || (existing.Cleanup == nil && (existing.Reserved || now.Before(existing.GraceExpiresAt))) {
 				continue
 			}
-			if s.cleaner == nil {
+			if err := s.cleanSlot(ctx, event, existing, revision); err != nil {
 				continue
 			}
-			if _, cleanErr := s.cleaner.Cleanup(ctx, uuid.NewString(), event.ApplicationID, event.ID, []string{existing.Subject}, "guest_slot_reclaimed"); cleanErr != nil {
+			// Re-create with a new CAS rather than overwriting an identity that
+			// a competing join might have installed after cleanup completed.
+			if slotRevision, createErr = s.store.Create(ctx, key, encode(slot)); errors.Is(createErr, store.ErrExists) {
 				continue
 			}
-			if _, createErr = s.store.Update(ctx, key, encode(slot), revision); createErr != nil {
-				continue
-			}
-			_ = s.store.Delete(ctx, sessionKey(existing.ResumeDigest))
 		}
 		if createErr != nil && !errors.Is(createErr, store.ErrExists) {
 			return Session{}, createErr
 		}
 		currentEvent, _, loadErr := s.loadEvent(ctx, event.ID)
 		if loadErr != nil || currentEvent.State != model.EventOpen || number > currentEvent.Capacity {
-			_ = s.store.Delete(ctx, key)
+			_ = s.store.DeleteRevision(ctx, key, slotRevision)
 			if loadErr != nil {
 				return Session{}, loadErr
 			}
 			return Session{}, ErrAdmissionClosed
 		}
 		if _, err = s.store.Create(ctx, sessionKey(slot.ResumeDigest), encode(model.SessionIndex{EventID: event.ID, Slot: number})); err != nil {
-			_ = s.store.Delete(ctx, key)
+			_ = s.store.DeleteRevision(ctx, key, slotRevision)
 			continue
 		}
 		return s.mint(event, slot, secret)
@@ -375,7 +383,7 @@ func (s *Service) renewLease(ctx context.Context, resumeSecret string) (model.Ev
 			return model.Event{}, model.Slot{}, ErrSessionExpired
 		}
 		now := s.now().UTC()
-		if !slot.Reserved && now.After(slot.GraceExpiresAt) {
+		if slot.Cleanup != nil || (!slot.Reserved && !now.Before(slot.GraceExpiresAt)) {
 			return model.Event{}, model.Slot{}, ErrSessionExpired
 		}
 		slot.LastSeenAt = now
@@ -423,41 +431,20 @@ func (s *Service) ReleaseSlot(ctx context.Context, principal, eventID string, nu
 	if !can(event, principal, model.CapabilityOperate) {
 		return ErrForbidden
 	}
-	slot, _, err := s.loadSlot(ctx, eventID, number)
-	if errors.Is(err, store.ErrNotFound) {
-		return ErrNotFound
+	if event.State == model.EventDeleting {
+		return ErrConflict
 	}
+	slot, revision, err := s.loadSlot(ctx, eventID, number)
 	if err != nil {
 		return err
 	}
-	if s.cleaner == nil {
-		return errors.New("cleanup is not configured")
-	}
-	if _, err := s.cleaner.Cleanup(ctx, uuid.NewString(), event.ApplicationID, event.ID, []string{slot.Subject}, "guest_slot_released"); err != nil {
-		return err
-	}
-	if err := s.store.Delete(ctx, slotKey(eventID, number)); err != nil {
-		return err
-	}
-	_ = s.store.Delete(ctx, sessionKey(slot.ResumeDigest))
-	return nil
+	return s.cleanSlot(ctx, event, slot, revision)
 }
 
 func (s *Service) DeleteEvent(ctx context.Context, principal, eventID string) (model.DeletionReceipt, error) {
 	event, revision, err := s.loadEvent(ctx, eventID)
 	if errors.Is(err, ErrNotFound) {
-		entry, receiptErr := s.store.Get(ctx, "receipt."+eventID)
-		if receiptErr != nil {
-			return model.DeletionReceipt{}, ErrNotFound
-		}
-		var receipt model.DeletionReceipt
-		if json.Unmarshal(entry.Value, &receipt) != nil {
-			return model.DeletionReceipt{}, ErrNotFound
-		}
-		if receipt.OwnerSubject != principal && receipt.DeletedBySubject != principal {
-			return model.DeletionReceipt{}, ErrForbidden
-		}
-		return receipt, nil
+		return s.GetReceipt(ctx, principal, eventID)
 	}
 	if err != nil {
 		return model.DeletionReceipt{}, err
@@ -466,57 +453,19 @@ func (s *Service) DeleteEvent(ctx context.Context, principal, eventID string) (m
 		return model.DeletionReceipt{}, ErrForbidden
 	}
 	if s.cleaner == nil {
-		return model.DeletionReceipt{}, fmt.Errorf("cleanup is not configured")
+		return model.DeletionReceipt{}, errors.New("cleanup is not configured")
 	}
 	if event.State != model.EventDeleting {
 		event.State = model.EventDeleting
 		event.DeletionID = uuid.NewString()
+		event.DeletedBySubject = principal
+		event.Cleanup = &model.CleanupProgress{ID: event.DeletionID, StartedAt: s.now().UTC()}
 		event.UpdatedAt = s.now().UTC()
-		if _, err = s.store.Update(ctx, eventKey(eventID), encode(event), revision); err != nil {
+		if revision, err = s.store.Update(ctx, eventKey(eventID), encode(event), revision); err != nil {
 			return model.DeletionReceipt{}, err
 		}
 	}
-	entries, err := s.store.List(ctx, "slot."+eventID+".")
-	if err != nil {
-		return model.DeletionReceipt{}, err
-	}
-	subjects := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		var slot model.Slot
-		if json.Unmarshal(entry.Value, &slot) == nil {
-			subjects = append(subjects, slot.Subject)
-		}
-	}
-	processed, err := s.cleaner.Cleanup(ctx, event.DeletionID, event.ApplicationID, event.ID, subjects, "demo_event_deleted")
-	if err != nil {
-		return model.DeletionReceipt{}, err
-	}
-	receipt := model.DeletionReceipt{
-		DeletionID: event.DeletionID,
-		EventID:    event.ID, ApplicationID: event.ApplicationID, OwnerSubject: event.OwnerSubject,
-		DeletedBySubject: principal, CreatedAt: event.CreatedAt, DeletedAt: s.now().UTC(), IdentitiesDeleted: processed,
-	}
-	if _, err = s.store.Create(ctx, "receipt."+event.ID, encode(receipt)); err != nil && !errors.Is(err, store.ErrExists) {
-		return model.DeletionReceipt{}, err
-	}
-	for key, entry := range entries {
-		var slot model.Slot
-		if json.Unmarshal(entry.Value, &slot) == nil {
-			if err := s.markSessionDeleted(ctx, slot); err != nil {
-				return model.DeletionReceipt{}, err
-			}
-		}
-		if err := deleteIfExists(ctx, s.store, key); err != nil {
-			return model.DeletionReceipt{}, err
-		}
-	}
-	if err := deleteIfExists(ctx, s.store, invitationKey(event.InvitationDigest)); err != nil {
-		return model.DeletionReceipt{}, err
-	}
-	if err := deleteIfExists(ctx, s.store, eventKey(event.ID)); err != nil {
-		return model.DeletionReceipt{}, err
-	}
-	return receipt, nil
+	return s.cleanEvent(ctx, event, revision)
 }
 
 func (s *Service) mint(event model.Event, slot model.Slot, resumeSecret string) (Session, error) {
@@ -571,7 +520,7 @@ func (s *Service) reserveSlots(ctx context.Context, eventID string) error {
 		if err := json.Unmarshal(entry.Value, &slot); err != nil {
 			return err
 		}
-		if slot.Reserved {
+		if slot.Reserved || slot.Cleanup != nil {
 			continue
 		}
 		slot.Reserved = true
