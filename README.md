@@ -135,3 +135,27 @@ make lint
 make test
 make build
 ```
+
+## Shared repository standards
+
+The shared declaration in `.github/.shared-config.yaml` uses the released
+`shared-v0.1.87` default selected by `project-lifecycle`, with the `hygiene`,
+`go`, `docker`, and `release` groups for this Go service. Canonical callers,
+hooks, and lint/release configuration come from
+`jr200-labs/github-action-templates`; edit the declaration or local overlays
+instead of generated files.
+
+Run `scripts/sync-shared --bootstrap` to synchronize callers and supporting
+files. `scripts/sync-shared --check` checks drift. The Go pre-commit configuration
+refreshes cached language configuration through `.shared/sync.sh`. Install
+`pre-commit` and `cocogitto` to use the generated local hooks.
+
+Release configuration is seeded from `project-lifecycle` with release type
+`go` and initial version `0.1.0`. Conventional commits drive the release PR;
+merging that PR creates the release and triggers the shared container publisher.
+Renovate extends the standard provider preset. Runner profiles and integration
+App credentials are supplied by the organization; their live configuration and
+the first automated release must be verified separately from file conformance.
+
+The shared groups fit this backend-only repository; no React starter, Node lane,
+Helm-chart publisher, or documentation-site publisher is selected.

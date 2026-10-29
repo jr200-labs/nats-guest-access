@@ -1,0 +1,186 @@
+# GENERATED/SHARED WORKFLOW: copied into consuming repos by sync-shared.
+# Do not edit in consuming repos; change jr200-labs/github-action-templates and sync.
+name: build-docker-image
+run-name: ${{ github.event.client_payload['release-tag'] || format('{0} by @{1}', github.event_name, github.actor) }}
+
+# Triggered by `release-published` repository_dispatch from
+# release-please.yaml when a tag is cut, or manually via
+# workflow_dispatch for ad-hoc dev builds. The single
+# release-published event type is used by every artifact-publishing
+# workflow so this caller can be a verbatim copy across repos.
+#
+# Multi-image support (JRL-39): consumers with more than one
+# Dockerfile, or a single Dockerfile at a non-default path, list
+# variants in `.github/images.yaml`. Each entry takes:
+#   name: <published image name (ghcr.io/<owner>/<name>)>
+#   dockerfile: <path to Dockerfile, relative to repo root>
+#   context: <optional, default repo root — set when COPY/ADD
+#            paths are relative to a subdirectory>
+#   component: <optional release-please component; release events build only matching images>
+#   success-tag-prefix: <optional Git tag prefix written after the image manifest succeeds>
+#
+#   images:
+#     - name: agent-base
+#       dockerfile: images/agent-base/Dockerfile
+#       context: images/agent-base   # rootfs/, etc. live here
+#     - name: agent-coder
+#       dockerfile: images/agent-coder/Dockerfile
+#       context: images/agent-coder
+#
+# Single-image consumers with a Dockerfile at the repo root or
+# `docker/Dockerfile` need no sidecar — the discover step falls back
+# to one synthetic entry using the repo name and the reusable's
+# default Dockerfile scan + repo-root context.
+#
+# Docker image platforms can be controlled org-wide with the
+# DOCKER_IMAGE_PLATFORMS repository/org variable. Accepted values are a
+# JSON array such as ["linux/amd64"] or a comma-separated string such as
+# linux/amd64,linux/arm64. workflow_dispatch inputs override the
+# variable for ad-hoc runs.
+#
+# A persistent remote builder is optional. Self-hosted runners can provide
+# BUILDKIT_ENDPOINT, BUILDKIT_SERVER_NAME, and BUILDKIT_TLS_DIR in their runtime
+# environment; the reusable detects them automatically. Other runners retain
+# the per-job docker-container builder and external caches.
+
+on:
+  repository_dispatch:
+    types: [release-published]
+  workflow_dispatch:
+    inputs:
+      checkout-ref:
+        description: "checkout ref"
+        required: false
+        type: string
+        default: "refs/heads/master"
+      tag:
+        description: docker-image-tag
+        required: false
+        type: string
+        default: dev
+      platforms:
+        description: platform-filter-json
+        required: false
+        type: string
+        default: |-
+          [ "linux/amd64", "linux/arm64" ]
+      build-args:
+        description: "Optional newline-delimited Docker build arguments"
+        required: false
+        type: string
+        default: ""
+
+# Only the caller's TOP-LEVEL permissions cascade into reusable
+# workflows. The reusable's nested jobs need packages:write (push to
+# ghcr.io) and contents:write — without this block the call
+# startup-fails with "is requesting 'packages: write', but is only
+# allowed 'packages: read'".
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  configure:
+    uses: jr200-labs/github-action-templates/.github/workflows/preconfigure.yaml@master
+    with:
+      event_name: ${{ toJson(github.event_name) }}
+      event: ${{ toJson(github.event) }}
+      runner: ${{ fromJSON(vars.RUNNER_PROFILES)[vars.RUNNER_PROFILE].default }}
+
+  discover-images:
+    needs: configure
+    runs-on: ${{ fromJSON(vars.RUNNER_PROFILES)[vars.RUNNER_PROFILE].default }}
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ fromJson(needs.configure.outputs.context).checkout-ref }}
+          sparse-checkout: |
+            .github/images.yaml
+          sparse-checkout-cone-mode: false
+      # yq comes from the ARC runner base image (jr200-labs/actions-
+      # runner-images >= v0.4.0, JRL-39). Installing it via the
+      # mikefarah/yq action doesn't put the binary on PATH — that
+      # action is a docker container action for running yq commands.
+      - id: gen
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+          RELEASE_COMPONENT: ${{ fromJson(needs.configure.outputs.context).component || '' }}
+        run: |
+          set -euo pipefail
+          if [ -f .github/images.yaml ]; then
+            # Release Please uses "." as the component for a root package with
+            # no explicit component name. That is the repository-wide release
+            # sentinel, so build every declared image rather than filtering for
+            # an image whose component is literally ".".
+            if [ -n "$RELEASE_COMPONENT" ] && [ "$RELEASE_COMPONENT" != "." ]; then
+              MATRIX=$(RELEASE_COMPONENT="$RELEASE_COMPONENT" yq -o=json -I=0 \
+                '{"include": [.images[] | select(.component == strenv(RELEASE_COMPONENT))]}' \
+                .github/images.yaml)
+              if [ "$(jq '.include | length' <<<"$MATRIX")" -eq 0 ]; then
+                echo "::error title=Release component has no image::No image declares component '$RELEASE_COMPONENT' in .github/images.yaml"
+                exit 1
+              fi
+            else
+              MATRIX=$(yq -o=json -I=0 '{"include": .images}' .github/images.yaml)
+            fi
+          else
+            MATRIX=$(jq -nc --arg name "$REPO_NAME" '{include: [{name: $name, dockerfile: ""}]}')
+          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Resolved matrix: $MATRIX"
+
+  main:
+    needs: [configure, discover-images]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-images.outputs.matrix) }}
+    uses: jr200-labs/github-action-templates/.github/workflows/build_docker_image_multiplatform.yaml@master
+    with:
+      checkout-ref: ${{ fromJson(needs.configure.outputs.context).checkout-ref }}
+      registry_name: ghcr.io
+      image_name: ${{ github.repository_owner }}/${{ matrix.name }}
+      dockerfile: ${{ matrix.dockerfile }}
+      context: ${{ matrix.context || '.' }}
+      build-contexts: ${{ matrix.build_contexts || '' }}
+      build-args: ${{ github.event.inputs.build-args || '' }}
+      tag: ${{ fromJson(needs.configure.outputs.context).tag }}
+      source-sha: ${{ fromJson(needs.configure.outputs.context).sha || '' }}
+      success-tag-prefix: ${{ matrix.success-tag-prefix || '' }}
+      platforms: ${{ fromJson(needs.configure.outputs.context).platforms || vars.DOCKER_IMAGE_PLATFORMS || '' }}
+      runner: ${{ fromJSON(vars.RUNNER_PROFILES)[vars.RUNNER_PROFILE].default }}
+    secrets:
+      registry_username: ${{ github.actor }}
+      registry_token: ${{ secrets.GITHUB_TOKEN }}
+      # GitHub App auth for cloning private git deps at build time
+      # (e.g. uv sync over `pkg @ git+https://github.com/<org>/<repo>`).
+      # The reusable mints an installation token and writes /tmp/.netrc
+      # only when both are non-empty; repos with no private deps can
+      # leave the org-level INTEGRATION_* unset and these resolve to ''
+      # without breaking the build.
+      client_id: ${{ vars.INTEGRATION_CLIENT_ID }}
+      app_private_key: ${{ secrets.INTEGRATION_APP_PRIVATE_KEY }}
+      # BuildKit secrets — exposed to RUN steps via
+      # `--mount=type=secret,id=ghcr_token`. Lets Dockerfiles pull
+      # private GHCR artifacts at build time. Every consumer gets
+      # ghcr_token wired by default; consumers that don't need it
+      # can ignore the secret.
+      build_secrets: |
+        ghcr_token=${{ secrets.GITHUB_TOKEN }}
+
+  notify-renovate:
+    needs: [configure, main]
+    if: github.event_name == 'repository_dispatch'
+    uses: jr200-labs/github-action-templates/.github/workflows/notify_artifact_published.yaml@master
+    with:
+      checkout-ref: ${{ fromJson(needs.configure.outputs.context).checkout-ref }}
+      publisher: docker
+      component: ${{ fromJson(needs.configure.outputs.context).component || '.' }}
+      version: ${{ fromJson(needs.configure.outputs.context).tag }}
+      source-sha: ${{ fromJson(needs.configure.outputs.context).sha || '' }}
+      dispatch-client-id: ${{ vars.RENOVATE_DISPATCH_CLIENT_ID || vars.INTEGRATION_CLIENT_ID }}
+      runner: ${{ fromJSON(vars.RUNNER_PROFILES)[vars.RUNNER_PROFILE].default }}
+    secrets:
+      dispatch_app_private_key: ${{ secrets.RENOVATE_DISPATCH_APP_PRIVATE_KEY }}
+      integration_app_private_key: ${{ secrets.INTEGRATION_APP_PRIVATE_KEY }}

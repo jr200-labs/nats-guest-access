@@ -1,0 +1,6 @@
+ref: shared-v0.1.87
+workflows:
+  - hygiene
+  - go
+  - docker
+  - release
