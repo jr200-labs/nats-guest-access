@@ -24,6 +24,7 @@ type API struct {
 }
 
 type eventResponse struct {
+	Cleanup               *model.CleanupProgress        `json:"cleanup,omitempty"`
 	ID                    string                        `json:"id"`
 	ApplicationID         string                        `json:"application_id"`
 	Name                  string                        `json:"name"`
@@ -37,6 +38,7 @@ type eventResponse struct {
 }
 
 type slotResponse struct {
+	CleanupPending bool      `json:"cleanup_pending"`
 	Number         int       `json:"number"`
 	Subject        string    `json:"subject"`
 	Reserved       bool      `json:"reserved"`
@@ -57,6 +59,7 @@ func New(service *access.Service, tokenIssuer *issuer.Issuer, presenters *Presen
 	mux.HandleFunc("POST /v1/guest-sessions/token", api.renewSession)
 	mux.HandleFunc("POST /v1/guest-sessions/heartbeat", api.heartbeatSession)
 	mux.HandleFunc("DELETE /v1/guest-sessions/current", api.endSession)
+	mux.HandleFunc("GET /v1/receipts", api.receipts)
 	mux.HandleFunc("/v1/events", api.events)
 	mux.HandleFunc("/v1/events/", api.event)
 	return securityHeaders(requestLog(bodyLimit(mux)))
@@ -281,6 +284,17 @@ func (a *API) event(w http.ResponseWriter, r *http.Request) {
 			views = append(views, slotView(slot))
 		}
 		writeJSON(w, http.StatusOK, views)
+	case "receipt":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+			return
+		}
+		receipt, err := a.access.GetReceipt(r.Context(), principal, eventID)
+		if err != nil {
+			a.writeAccessError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, receipt)
 	case "delete":
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
@@ -307,7 +321,15 @@ func (a *API) setResumeCookie(w http.ResponseWriter, secret string) {
 func (a *API) writeAccessError(w http.ResponseWriter, err error) {
 	status, code := http.StatusInternalServerError, "internal_error"
 	switch {
-	case errors.Is(err, access.ErrNotFound), errors.Is(err, access.ErrSessionExpired):
+	case errors.Is(err, access.ErrCleanupPending):
+		status, code = http.StatusServiceUnavailable, "cleanup_pending"
+	case errors.Is(err, access.ErrEventDeleted):
+		status, code = http.StatusGone, "event_deleted"
+	case errors.Is(err, access.ErrEventPaused):
+		status, code = http.StatusServiceUnavailable, "event_paused"
+	case errors.Is(err, access.ErrSessionExpired):
+		status, code = http.StatusGone, "session_expired"
+	case errors.Is(err, access.ErrNotFound):
 		status, code = http.StatusNotFound, "not_found"
 	case errors.Is(err, access.ErrForbidden):
 		status, code = http.StatusForbidden, "forbidden"
@@ -344,7 +366,7 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 
 func eventView(event model.Event) eventResponse {
 	return eventResponse{
-		ID: event.ID, ApplicationID: event.ApplicationID, Name: event.Name,
+		Cleanup: event.Cleanup, ID: event.ID, ApplicationID: event.ApplicationID, Name: event.Name,
 		OwnerSubject: event.OwnerSubject, Capacity: event.Capacity,
 		InspectLiveWorkspaces: event.InspectLiveWorkspaces, State: event.State,
 		Cohosts: event.Cohosts, CreatedAt: event.CreatedAt, UpdatedAt: event.UpdatedAt,
@@ -353,7 +375,7 @@ func eventView(event model.Event) eventResponse {
 
 func slotView(slot model.Slot) slotResponse {
 	return slotResponse{
-		Number: slot.Number, Subject: slot.Subject, Reserved: slot.Reserved,
+		CleanupPending: slot.Cleanup != nil, Number: slot.Number, Subject: slot.Subject, Reserved: slot.Reserved,
 		LeaseExpiresAt: slot.LeaseExpiresAt, GraceExpiresAt: slot.GraceExpiresAt,
 		CreatedAt: slot.CreatedAt, LastSeenAt: slot.LastSeenAt,
 	}
@@ -381,4 +403,18 @@ func requestLog(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 		slog.Info("request", "method", r.Method, "path", r.URL.Path, "duration_ms", strconv.FormatInt(time.Since(started).Milliseconds(), 10))
 	})
+}
+
+func (a *API) receipts(w http.ResponseWriter, r *http.Request) {
+	principal, err := a.presenters.Verify(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "presenter authentication failed")
+		return
+	}
+	receipts, err := a.access.ListReceipts(r.Context(), principal)
+	if err != nil {
+		a.writeAccessError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, receipts)
 }

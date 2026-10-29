@@ -163,3 +163,31 @@ func TestDeleteRequiresPermissionAndLeavesReceipt(t *testing.T) {
 		t.Fatalf("deleted event still available: %v", err)
 	}
 }
+
+func TestPausedAndDeletedSessionsHaveDistinctTerminalState(t *testing.T) {
+	service, _ := newTestService(t, 1)
+	ctx := context.Background()
+	event := createOpenEvent(t, service, 1)
+	session, err := service.StartSession(ctx, invitationSecret(event.InvitationURL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !session.GraceExpiresAt.After(session.LeaseExpiresAt) {
+		t.Fatal("missing grace boundary")
+	}
+	if _, err = service.SetState(ctx, "presenter", event.Event.ID, model.EventPaused); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.RenewSession(ctx, session.ResumeSecret); !errors.Is(err, ErrEventPaused) {
+		t.Fatalf("paused: %v", err)
+	}
+	if _, err = service.DeleteEvent(ctx, "presenter", event.Event.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.RenewSession(ctx, session.ResumeSecret); !errors.Is(err, ErrEventDeleted) {
+		t.Fatalf("deleted: %v", err)
+	}
+	if _, err = service.RenewSession(ctx, "unknown"); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("expired: %v", err)
+	}
+}

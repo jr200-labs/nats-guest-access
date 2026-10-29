@@ -13,6 +13,8 @@ const (
 )
 
 type Event struct {
+	Cleanup               *CleanupProgress        `json:"cleanup,omitempty"`
+	DeletedBySubject      string                  `json:"deleted_by_subject,omitempty"`
 	ID                    string                  `json:"id"`
 	ApplicationID         string                  `json:"application_id"`
 	Name                  string                  `json:"name"`
@@ -36,19 +38,21 @@ const (
 )
 
 type Slot struct {
-	EventID        string    `json:"event_id"`
-	Number         int       `json:"number"`
-	Generation     string    `json:"generation"`
-	Subject        string    `json:"subject"`
-	ResumeDigest   string    `json:"resume_digest"`
-	Reserved       bool      `json:"reserved"`
-	LeaseExpiresAt time.Time `json:"lease_expires_at"`
-	GraceExpiresAt time.Time `json:"grace_expires_at"`
-	CreatedAt      time.Time `json:"created_at"`
-	LastSeenAt     time.Time `json:"last_seen_at"`
+	Cleanup        *CleanupProgress `json:"cleanup,omitempty"`
+	EventID        string           `json:"event_id"`
+	Number         int              `json:"number"`
+	Generation     string           `json:"generation"`
+	Subject        string           `json:"subject"`
+	ResumeDigest   string           `json:"resume_digest"`
+	Reserved       bool             `json:"reserved"`
+	LeaseExpiresAt time.Time        `json:"lease_expires_at"`
+	GraceExpiresAt time.Time        `json:"grace_expires_at"`
+	CreatedAt      time.Time        `json:"created_at"`
+	LastSeenAt     time.Time        `json:"last_seen_at"`
 }
 
 type SessionIndex struct {
+	Deleted bool   `json:"deleted,omitempty"`
 	EventID string `json:"event_id"`
 	Slot    int    `json:"slot"`
 }
@@ -62,4 +66,14 @@ type DeletionReceipt struct {
 	CreatedAt         time.Time `json:"created_at"`
 	DeletedAt         time.Time `json:"deleted_at"`
 	IdentitiesDeleted int       `json:"identities_deleted"`
+}
+
+// CleanupProgress is durable retry state. LastError is a bounded code, never a
+// downstream error string (which could contain credentials or user content).
+type CleanupProgress struct {
+	ID            string    `json:"id"`
+	Attempts      int       `json:"attempts"`
+	StartedAt     time.Time `json:"started_at"`
+	NextAttemptAt time.Time `json:"next_attempt_at"`
+	LastError     string    `json:"last_error,omitempty"`
 }

@@ -21,5 +21,6 @@ type Store interface {
 	Create(context.Context, string, []byte) (uint64, error)
 	Update(context.Context, string, []byte, uint64) (uint64, error)
 	Delete(context.Context, string) error
+	DeleteRevision(context.Context, string, uint64) error
 	List(context.Context, string) (map[string]Entry, error)
 }

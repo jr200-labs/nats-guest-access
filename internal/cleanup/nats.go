@@ -69,8 +69,8 @@ func (n *NATS) Cleanup(ctx context.Context, deletionID, applicationID, eventID s
 	if response.Status != "complete" {
 		return 0, fmt.Errorf("application cleanup failed: %s", response.Error)
 	}
-	if response.IdentitiesProcessed < 0 {
-		return 0, errors.New("application cleanup returned a negative identity count")
+	if response.IdentitiesProcessed != len(subjects) {
+		return 0, errors.New("application cleanup did not acknowledge every identity")
 	}
 	return response.IdentitiesProcessed, nil
 }

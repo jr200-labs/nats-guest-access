@@ -75,3 +75,17 @@ func (m *Memory) List(_ context.Context, prefix string) (map[string]Entry, error
 	}
 	return result, nil
 }
+
+func (m *Memory) DeleteRevision(_ context.Context, key string, revision uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.entries[key]
+	if !ok {
+		return ErrNotFound
+	}
+	if entry.Revision != revision {
+		return ErrConflict
+	}
+	delete(m.entries, key)
+	return nil
+}

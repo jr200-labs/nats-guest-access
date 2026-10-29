@@ -24,6 +24,7 @@ import (
 	"github.com/jr200-labs/nats-guest-access/internal/cleanup"
 	"github.com/jr200-labs/nats-guest-access/internal/config"
 	"github.com/jr200-labs/nats-guest-access/internal/issuer"
+	"github.com/jr200-labs/nats-guest-access/internal/recovery"
 	"github.com/jr200-labs/nats-guest-access/internal/store"
 )
 
@@ -78,10 +79,23 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("configure presenter verifier: %w", err)
 	}
-	cleaner := cleanup.NewNATS(nc, cfg.CleanupSubject, cfg.CleanupTimeout)
+	var cleaner access.Cleaner
+	if cfg.CleanupSubject != "" {
+		cleaner = cleanup.NewNATS(nc, cfg.CleanupSubject, cfg.CleanupTimeout)
+	}
 	service := access.New(repository, tokenIssuer, cfg.InvitationHMACKey, cfg.PublicDemoURL, cfg.MaxCapacity, cfg.LeaseTTL, cfg.GracePeriod, cleaner)
+	service.ConfigureCleanupLease(cfg.CleanupTimeout)
+	controller := recovery.New(service, cfg.CleanupInterval, cfg.CleanupBatchSize)
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", controller)
+	mux.Handle("/", api.New(service, tokenIssuer, presenters, cfg.SecureCookies))
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	defer stopWorker()
+	workerDone := make(chan struct{})
+	go func() { defer close(workerDone); controller.Run(workerCtx) }()
+	defer func() { stopWorker(); <-workerDone }()
 	server := &http.Server{
-		Addr: cfg.ListenAddress, Handler: api.New(service, tokenIssuer, presenters, cfg.SecureCookies),
+		Addr: cfg.ListenAddress, Handler: mux,
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second,
 		WriteTimeout: 35 * time.Second, IdleTimeout: 60 * time.Second,
 	}

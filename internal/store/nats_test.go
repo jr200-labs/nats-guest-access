@@ -57,7 +57,14 @@ func TestNATSStoreCASAndListing(t *testing.T) {
 	if len(entries) != 1 || string(entries["event.one"].Value) != "two" {
 		t.Fatalf("unexpected entries: %+v", entries)
 	}
-	if err := repository.Delete(context.Background(), "event.one"); err != nil {
+	current, err := repository.Get(context.Background(), "event.one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.DeleteRevision(context.Background(), "event.one", revision); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale delete: %v", err)
+	}
+	if err := repository.DeleteRevision(context.Background(), "event.one", current.Revision); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := repository.Get(context.Background(), "event.one"); !errors.Is(err, ErrNotFound) {

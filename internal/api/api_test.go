@@ -74,3 +74,28 @@ func TestInvitationStartsAndResumesBrowserSession(t *testing.T) {
 		t.Fatalf("resumed a different session: %+v", resumed)
 	}
 }
+
+func TestGuestLifecycleErrorCodes(t *testing.T) {
+	api := &API{}
+	for _, test := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{access.ErrEventPaused, 503, "event_paused"},
+		{access.ErrEventDeleted, 410, "event_deleted"},
+		{access.ErrSessionExpired, 410, "session_expired"},
+		{access.ErrAdmissionClosed, 503, "admission_closed"},
+		{access.ErrCapacity, 429, "capacity_reached"},
+	} {
+		recorder := httptest.NewRecorder()
+		api.writeAccessError(recorder, test.err)
+		var body map[string]string
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if recorder.Code != test.status || body["code"] != test.code {
+			t.Fatalf("%s: %d %v", test.code, recorder.Code, body)
+		}
+	}
+}
