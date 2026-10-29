@@ -30,6 +30,8 @@ var (
 	ErrCapacity        = errors.New("event is at capacity")
 	ErrAdmissionClosed = errors.New("admission is closed")
 	ErrSessionExpired  = errors.New("session expired")
+	ErrEventPaused     = fmt.Errorf("%w: event paused", ErrAdmissionClosed)
+	ErrEventDeleted    = errors.New("event deleted")
 )
 
 var applicationIDPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
@@ -70,6 +72,7 @@ type Session struct {
 	Token          string    `json:"token"`
 	TokenExpiresAt time.Time `json:"token_expires_at"`
 	LeaseExpiresAt time.Time `json:"lease_expires_at"`
+	GraceExpiresAt time.Time `json:"grace_expires_at"`
 	ResumeSecret   string    `json:"-"`
 }
 
@@ -264,6 +267,9 @@ func (s *Service) StartSession(ctx context.Context, invitation string) (Session,
 	if err != nil {
 		return Session{}, err
 	}
+	if event.State == model.EventPaused {
+		return Session{}, ErrEventPaused
+	}
 	if event.State != model.EventOpen || event.Capacity == 0 {
 		return Session{}, ErrAdmissionClosed
 	}
@@ -347,10 +353,19 @@ func (s *Service) renewLease(ctx context.Context, resumeSecret string) (model.Ev
 	if err = json.Unmarshal(indexEntry.Value, &index); err != nil {
 		return model.Event{}, model.Slot{}, err
 	}
+	if index.Deleted {
+		return model.Event{}, model.Slot{}, ErrEventDeleted
+	}
 	for attempt := 0; attempt < 5; attempt++ {
 		event, _, err := s.loadEvent(ctx, index.EventID)
 		if err != nil {
 			return model.Event{}, model.Slot{}, err
+		}
+		if event.State == model.EventPaused {
+			return model.Event{}, model.Slot{}, ErrEventPaused
+		}
+		if event.State == model.EventDeleting || event.State == model.EventDeleted {
+			return model.Event{}, model.Slot{}, ErrEventDeleted
 		}
 		if event.State != model.EventOpen {
 			return model.Event{}, model.Slot{}, ErrAdmissionClosed
@@ -487,7 +502,7 @@ func (s *Service) DeleteEvent(ctx context.Context, principal, eventID string) (m
 	for key, entry := range entries {
 		var slot model.Slot
 		if json.Unmarshal(entry.Value, &slot) == nil {
-			if err := deleteIfExists(ctx, s.store, sessionKey(slot.ResumeDigest)); err != nil {
+			if err := s.markSessionDeleted(ctx, slot); err != nil {
 				return model.DeletionReceipt{}, err
 			}
 		}
@@ -515,7 +530,7 @@ func (s *Service) mint(event model.Event, slot model.Slot, resumeSecret string) 
 	}
 	return Session{
 		EventID: event.ID, Subject: slot.Subject, DisplayName: display, Slot: slot.Number,
-		Token: token, TokenExpiresAt: expires, LeaseExpiresAt: slot.LeaseExpiresAt, ResumeSecret: resumeSecret,
+		Token: token, TokenExpiresAt: expires, LeaseExpiresAt: slot.LeaseExpiresAt, GraceExpiresAt: slot.GraceExpiresAt, ResumeSecret: resumeSecret,
 	}, nil
 }
 
@@ -624,4 +639,26 @@ func invitationKey(digest string) string { return "invitation." + digest }
 func sessionKey(digest string) string    { return "session." + digest }
 func slotKey(eventID string, number int) string {
 	return fmt.Sprintf("slot.%s.%03d", eventID, number)
+}
+
+// Preserve only the hashed resume lookup so an existing cookie gets a terminal
+// deletion response. No bearer/resume secret is stored in the tombstone.
+func (s *Service) markSessionDeleted(ctx context.Context, slot model.Slot) error {
+	key := sessionKey(slot.ResumeDigest)
+	for attempt := 0; attempt < 5; attempt++ {
+		entry, err := s.store.Get(ctx, key)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		value := model.SessionIndex{EventID: slot.EventID, Slot: slot.Number, Deleted: true}
+		if _, err = s.store.Update(ctx, key, encode(value), entry.Revision); errors.Is(err, store.ErrConflict) {
+			continue
+		} else {
+			return err
+		}
+	}
+	return ErrConflict
 }

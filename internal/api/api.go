@@ -307,7 +307,13 @@ func (a *API) setResumeCookie(w http.ResponseWriter, secret string) {
 func (a *API) writeAccessError(w http.ResponseWriter, err error) {
 	status, code := http.StatusInternalServerError, "internal_error"
 	switch {
-	case errors.Is(err, access.ErrNotFound), errors.Is(err, access.ErrSessionExpired):
+	case errors.Is(err, access.ErrEventDeleted):
+		status, code = http.StatusGone, "event_deleted"
+	case errors.Is(err, access.ErrEventPaused):
+		status, code = http.StatusServiceUnavailable, "event_paused"
+	case errors.Is(err, access.ErrSessionExpired):
+		status, code = http.StatusGone, "session_expired"
+	case errors.Is(err, access.ErrNotFound):
 		status, code = http.StatusNotFound, "not_found"
 	case errors.Is(err, access.ErrForbidden):
 		status, code = http.StatusForbidden, "forbidden"

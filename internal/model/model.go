@@ -49,6 +49,7 @@ type Slot struct {
 }
 
 type SessionIndex struct {
+	Deleted bool   `json:"deleted,omitempty"`
 	EventID string `json:"event_id"`
 	Slot    int    `json:"slot"`
 }
